@@ -73,9 +73,16 @@ async function saveLastSession(id: string): Promise<void> {
 
 // ── core ────────────────────────────────────────────────────────────────────
 
+// Anthropic SDK's content_block_delta event for streamed text. Narrowed
+// structurally so we don't pull in @anthropic-ai/sdk just for the type.
+interface TextBlockDelta {
+  type: "content_block_delta";
+  delta: { type: "text_delta"; text: string };
+}
+
 async function promptAndCollect(
   prompt: string,
-  opts: { model?: string; resume?: string; trace?: boolean },
+  opts: { model?: string; resume?: string; trace?: boolean; stream?: boolean },
 ): Promise<PromptResult> {
   const q = query({
     prompt,
@@ -85,6 +92,9 @@ async function promptAndCollect(
       // chat-only: no tools loaded, no settings sourced (settingSources defaults to []),
       // empty system prompt (systemPrompt defaults to undefined).
       tools: [],
+      // includePartialMessages opens a stream_event channel carrying token-level
+      // deltas. Off by default; on for interactive one-shot and REPL paths.
+      includePartialMessages: !!opts.stream,
     },
   });
 
@@ -99,7 +109,21 @@ async function promptAndCollect(
       sessionId = msg.session_id;
     }
 
-    if (msg.type === "assistant") {
+    if (opts.stream && msg.type === "stream_event") {
+      // Token-level path: flush text_delta to stdout, accumulate into reply.
+      // The full assistant message arrives separately and is skipped below
+      // (else-if) so we don't double-count.
+      const ev = msg.event as Partial<TextBlockDelta>;
+      if (
+        ev.type === "content_block_delta" &&
+        ev.delta?.type === "text_delta" &&
+        typeof ev.delta.text === "string"
+      ) {
+        stdout.write(ev.delta.text);
+        reply += ev.delta.text;
+      }
+    } else if (!opts.stream && msg.type === "assistant") {
+      // Non-streaming path: accumulate from canonical assistant blocks.
       for (const block of msg.message.content) {
         if (block.type === "text") reply += block.text;
       }
@@ -135,8 +159,14 @@ async function readStdin(): Promise<string> {
 // ── mode 1: one-shot ────────────────────────────────────────────────────────
 
 async function runOneShot(prompt: string, opts: CommonOpts): Promise<void> {
-  const r = await promptAndCollect(prompt, opts);
-  emit(opts, r);
+  if (opts.json) {
+    // JSON mode keeps a single-line shape — incompatible with mid-line streaming.
+    const r = await promptAndCollect(prompt, opts);
+    emit(opts, r);
+  } else {
+    await promptAndCollect(prompt, { ...opts, stream: true });
+    stdout.write("\n");
+  }
 }
 
 // ── mode 2: REPL ────────────────────────────────────────────────────────────
@@ -153,10 +183,18 @@ async function runRepl(opts: CommonOpts): Promise<void> {
       if (!opts.quiet) stderr.write("you> ");
       continue;
     }
-    const r = await promptAndCollect(line, { ...opts, resume: sessionId });
-    sessionId = r.sessionId;
     if (!opts.quiet) stderr.write("claude> ");
-    emit(opts, r);
+    const r = await promptAndCollect(line, {
+      ...opts,
+      resume: sessionId,
+      stream: !opts.json,
+    });
+    sessionId = r.sessionId;
+    if (opts.json) {
+      emit(opts, r);
+    } else {
+      stdout.write("\n");
+    }
     if (!opts.quiet) stderr.write("you> ");
   }
   if (!opts.quiet) stderr.write("\nbye\n");
