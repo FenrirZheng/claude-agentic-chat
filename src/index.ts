@@ -42,14 +42,25 @@ interface PromptResult {
 interface DaemonRequest {
   prompt?: string;
   shutdown?: boolean;
+  stream?: boolean;
 }
 
+// Wire shapes — a single response is one of:
+//   non-stream prompt: { reply, stop_reason, session_id }
+//   shutdown ack:      { ok: true }
+//   error:             { error }
+// A streamed prompt is a sequence:
+//   zero or more frames: { chunk: "..." }
+//   then exactly one terminator: { reply, stop_reason, session_id, done: true }
+// Errors mid-stream are delivered as { error } and end the stream.
 interface DaemonResponse {
   reply?: string;
   stop_reason?: string;
   session_id?: string;
   ok?: boolean;
   error?: string;
+  chunk?: string;
+  done?: boolean;
 }
 
 // ── persisted session state ─────────────────────────────────────────────────
@@ -101,6 +112,10 @@ interface PromptCallOpts {
   stream?: boolean;
   allowTools?: boolean;
   permissionMode?: PermissionMode;
+  // When stream=true: deltas are routed to onChunk if set, otherwise written
+  // to stdout. The daemon uses this to push chunks into the socket without
+  // polluting its own stdout. reply still accumulates and is returned.
+  onChunk?: (text: string) => void;
 }
 
 function buildSdkOptions(opts: PromptCallOpts): SdkOptions {
@@ -157,17 +172,19 @@ async function promptAndCollect(
     }
 
     if (opts.stream && msg.type === "stream_event") {
-      // Token-level path: flush text_delta to stdout, accumulate into reply.
-      // The full assistant message arrives separately and is skipped below
-      // (else-if) so we don't double-count.
+      // Token-level path: flush text_delta to onChunk (or stdout), accumulate
+      // into reply. The full assistant message arrives separately and is
+      // skipped below (else-if) so we don't double-count.
       const ev = msg.event as Partial<TextBlockDelta>;
       if (
         ev.type === "content_block_delta" &&
         ev.delta?.type === "text_delta" &&
         typeof ev.delta.text === "string"
       ) {
-        stdout.write(ev.delta.text);
-        reply += ev.delta.text;
+        const text = ev.delta.text;
+        if (opts.onChunk) opts.onChunk(text);
+        else stdout.write(text);
+        reply += text;
       }
     } else if (!opts.stream && msg.type === "assistant") {
       // Non-streaming path: accumulate from canonical assistant blocks.
@@ -322,6 +339,8 @@ async function runDaemon(opts: CommonOpts): Promise<void> {
       return;
     }
 
+    const wantsStream = !!req.stream;
+
     try {
       const r = await promptAndCollect(req.prompt, {
         model: opts.model,
@@ -329,16 +348,34 @@ async function runDaemon(opts: CommonOpts): Promise<void> {
         trace: opts.trace,
         allowTools: opts.allowTools,
         permissionMode: opts.permissionMode,
+        stream: wantsStream,
+        onChunk: wantsStream
+          ? (text: string) => {
+              // Each delta becomes its own NDJSON line. Backpressure is
+              // ignored — for a single-client-per-connection design, kernel
+              // socket buffers absorb the typical reply size; if it ever
+              // matters, await drain via a Promise wrapper here.
+              conn.write(
+                JSON.stringify({ chunk: text } satisfies DaemonResponse) + "\n",
+              );
+            }
+          : undefined,
       });
       sessionId = r.sessionId;
       await saveLastSession(r.sessionId);
-      conn.end(
-        JSON.stringify({
-          reply: r.reply,
-          stop_reason: r.stopReason,
-          session_id: r.sessionId,
-        } satisfies DaemonResponse) + "\n",
-      );
+      const terminator: DaemonResponse = wantsStream
+        ? {
+            reply: r.reply,
+            stop_reason: r.stopReason,
+            session_id: r.sessionId,
+            done: true,
+          }
+        : {
+            reply: r.reply,
+            stop_reason: r.stopReason,
+            session_id: r.sessionId,
+          };
+      conn.end(JSON.stringify(terminator) + "\n");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       conn.end(JSON.stringify({ error: msg } satisfies DaemonResponse) + "\n");
@@ -391,10 +428,49 @@ async function runConnect(
     conn.once("error", reject);
   });
 
-  const req: DaemonRequest = opts.shutdown ? { shutdown: true } : { prompt: prompt ?? "" };
+  // Stream by default — same heuristic as one-shot: --json forces a single
+  // collected frame. --shutdown is a one-line ack, never streamed.
+  const wantsStream = !opts.shutdown && !opts.json;
+
+  const req: DaemonRequest = opts.shutdown
+    ? { shutdown: true }
+    : { prompt: prompt ?? "", ...(wantsStream ? { stream: true } : {}) };
   conn.write(JSON.stringify(req) + "\n");
   conn.end();
 
+  if (wantsStream) {
+    // Multi-line NDJSON: chunks then a done terminator. Read line-by-line.
+    const rl = createInterface({ input: conn, terminal: false });
+    let terminator: DaemonResponse | undefined;
+    for await (const line of rl) {
+      if (!line) continue;
+      let frame: DaemonResponse;
+      try {
+        frame = JSON.parse(line) as DaemonResponse;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        stderr.write(`error: bad daemon frame: ${msg}\n`);
+        exit(1);
+      }
+      if (frame.error) {
+        stderr.write(`error: ${frame.error}\n`);
+        exit(1);
+      }
+      if (typeof frame.chunk === "string") stdout.write(frame.chunk);
+      if (frame.done) {
+        terminator = frame;
+        break;
+      }
+    }
+    if (!terminator) {
+      stderr.write("error: daemon closed connection mid-stream\n");
+      exit(1);
+    }
+    stdout.write("\n");
+    return;
+  }
+
+  // Non-streaming: read whole response (single line), parse, emit.
   let buf = "";
   for await (const chunk of conn) buf += chunk.toString();
 
@@ -415,11 +491,8 @@ async function runConnect(
     if (!opts.quiet) stderr.write("daemon stopped\n");
     return;
   }
-  if (opts.json) {
-    stdout.write(JSON.stringify(resp) + "\n");
-  } else {
-    stdout.write((resp.reply ?? "") + "\n");
-  }
+  // Only --json reaches here for prompts. Print the daemon's frame verbatim.
+  stdout.write(JSON.stringify(resp) + "\n");
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────────

@@ -27,7 +27,9 @@ One-shot, REPL, daemon, connect — same shape as [gemini-acp's CLAUDE.md §"The
 - **`--allow-tools` opens up the full Claude Code tool set** — see [Tool access](#tool-access) for permission modes and the cwd allowlist boundary.
 - **Token streaming is on by default** for one-shot and REPL when `--json` is NOT set. The SDK's `includePartialMessages: true` opens a `stream_event` channel carrying Anthropic-SDK `content_block_delta` events; their `text_delta.text` payloads flush to stdout as they arrive. `--json` forces collected output (one JSON line, incompatible with mid-line streaming). Daemon never streams (would need a multi-line wire protocol — see [Future work](#future-work)).
 - **Daemon session continuity** is per-turn `query({resume: lastSessionId})`, where `lastSessionId` is captured from the SDK's `session_id` field (present on `system` / `assistant` / `result` messages alike). No long-lived `claude` subprocess — each turn re-spawns. Cheap because the SDK doesn't pay ACP's npx package-resolution tax.
-- **Daemon ↔ connect wire protocol** is identical to [gemini-acp's TECHNICAL.md §4](../gemini-acp/TECHNICAL.md#4-mode-by-mode-reference). One `\n`-terminated JSON line per direction over `/tmp/claude-chat-$USER.sock`. Request shapes: `{prompt} | {shutdown:true}`. Response shapes: `{reply, stop_reason, session_id} | {ok:true} | {error}`.
+- **Daemon ↔ connect wire protocol** has two modes over `/tmp/claude-chat-$USER.sock`:
+  - **Single-frame** (default for shutdown, `--json` prompts): one `\n`-terminated JSON line per direction. Request shapes: `{prompt} | {shutdown:true}`. Response shapes: `{reply, stop_reason, session_id} | {ok:true} | {error}`.
+  - **NDJSON stream** (default for non-`--json` prompts): client adds `stream:true` to its request. Daemon emits zero or more `{chunk:"..."}` frames followed by exactly one `{reply, stop_reason, session_id, done:true}` terminator, all `\n`-separated. Errors mid-stream arrive as `{error}` and terminate the stream. Client `--connect` reads frame-by-frame via `readline` and prints `chunk` payloads to stdout as they arrive. See [gemini-acp's TECHNICAL.md §4](../gemini-acp/TECHNICAL.md#4-mode-by-mode-reference) for the reference single-frame protocol; the streaming variant is novel here and unique to claude-chat.
 
 ## Tool access
 
@@ -50,7 +52,7 @@ See `buildSdkOptions` in [src/index.ts](src/index.ts) for the exact branch.
 - Stale-socket detection: on bind, daemon `existsSync()`s the path, then probes with `createConnection` (`probeSocket` in [src/index.ts](src/index.ts)). Connect-success ⇒ refuse to start (another daemon owns it). Connect-fail ⇒ stale, `unlinkSync`, then bind.
 - **`allowHalfOpen: true` on `createServer` is mandatory** — see [Editing src/index.ts](#editing-srcindexts) trap 1 for why.
 - Proper stop: `claude-chat --connect --shutdown`. `SIGINT` / `SIGTERM` also clean up the socket file.
-- One in-flight `query()` at a time: a `Promise` chain (`queue = queue.then(...)` in `runDaemon`) serializes concurrent connections. Concurrent prompts on one session would interleave conversation state — same honest-serial design as gemini-acp's single-threaded `tokio::select!`.
+- One in-flight `query()` at a time: a `Promise` chain (`queue = queue.then(...)` in `runDaemon`) serializes concurrent connections. Concurrent prompts on one session would interleave conversation state — same honest-serial design as gemini-acp's single-threaded `tokio::select!`. Note: a long streaming response holds the queue until its `done:true` terminator goes out, so a second `--connect` waits behind it. By design — interleaving streams across one session would be incoherent.
 - **Session persistence across daemon restarts is wired.** After every successful turn the daemon writes the current `sessionId` to `${XDG_STATE_HOME:-~/.local/state}/claude-chat/last-session`. On the next `--daemon` startup, that id is auto-loaded (banner: `claude-chat: resuming session <id>`) and used as the implicit `resume:` for the first turn. `--resume <id>` overrides; `--fresh` suppresses load and starts a new conversation. To wipe state manually: `rm ~/.local/state/claude-chat/last-session`. One-shot and REPL modes intentionally don't read or write this file — see `getStatePath` / `loadLastSession` / `saveLastSession` in [src/index.ts](src/index.ts).
 
 ## Editing src/index.ts
@@ -93,7 +95,6 @@ After `git init`: local-only, no remote. Per global rule in [`~/.claude/CLAUDE.m
 
 Not done yet, listed so you don't accidentally invent the same feature twice:
 
-- **Daemon streaming.** Today the daemon collects the full reply server-side and writes one JSON line per request. To stream tokens through the daemon to a `--connect` client, the wire protocol needs a multi-message shape — e.g. NDJSON: `{"chunk":"..."}\n{"chunk":"..."}\n{"reply":"...","stop_reason":"...","session_id":"...","done":true}\n`. Doable but a real protocol-version change.
 - **Streaming-input mode.** Today each turn is a fresh `query({prompt: string, ...})` — re-spawning `claude` per turn. Switching to `query({prompt: asyncIterable, ...})` keeps one `claude` subprocess alive across turns. Only worth doing if profiling shows re-spawn dominates; today the LLM round-trip drowns it out.
 - **Structured `stop_reason`.** Today we forward the SDK's `subtype` verbatim (`"success"`, `"error_max_turns"`, …). Acceptable today; brittle if consumers parse exact strings.
 
