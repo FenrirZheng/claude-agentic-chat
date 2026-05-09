@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import { createServer, createConnection, type Socket } from "node:net";
 import { existsSync, unlinkSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -8,6 +8,18 @@ import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { stdin, stdout, stderr, exit } from "node:process";
 import { createInterface } from "node:readline";
+
+type PermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan";
+const PERMISSION_MODES: readonly PermissionMode[] = [
+  "default",
+  "acceptEdits",
+  "bypassPermissions",
+  "plan",
+];
+
+// Derive the SDK options shape directly from the SDK's own types — no need to
+// re-import or reshape; if the SDK adds a field, this picks it up.
+type SdkOptions = NonNullable<Parameters<typeof query>[0]["options"]>;
 
 interface CommonOpts {
   model?: string;
@@ -17,6 +29,8 @@ interface CommonOpts {
   socket: string;
   trace: boolean;
   fresh: boolean;
+  allowTools: boolean;
+  permissionMode?: PermissionMode;
 }
 
 interface PromptResult {
@@ -80,22 +94,55 @@ interface TextBlockDelta {
   delta: { type: "text_delta"; text: string };
 }
 
+interface PromptCallOpts {
+  model?: string;
+  resume?: string;
+  trace?: boolean;
+  stream?: boolean;
+  allowTools?: boolean;
+  permissionMode?: PermissionMode;
+}
+
+function buildSdkOptions(opts: PromptCallOpts): SdkOptions {
+  const base: SdkOptions = {
+    model: opts.model,
+    resume: opts.resume,
+    // includePartialMessages opens a stream_event channel carrying token-level
+    // deltas. Off by default; on for interactive one-shot and REPL paths.
+    includePartialMessages: !!opts.stream,
+  };
+
+  if (!opts.allowTools) {
+    // chat-only: no tools loaded, no settings sourced (settingSources defaults
+    // to []), empty system prompt (systemPrompt defaults to undefined).
+    return { ...base, tools: [] };
+  }
+
+  // Tools enabled: pull in Claude Code's full tool set + system prompt, and
+  // load user + project settings so CLAUDE.md gets honoured. Permission mode
+  // gates what the agent may do without prompting.
+  const mode: PermissionMode = opts.permissionMode ?? "acceptEdits";
+  const withTools: SdkOptions = {
+    ...base,
+    tools: { type: "preset", preset: "claude_code" },
+    systemPrompt: { type: "preset", preset: "claude_code" },
+    settingSources: ["user", "project"],
+    permissionMode: mode,
+  };
+  if (mode === "bypassPermissions") {
+    // SDK requires this companion flag to honour bypassPermissions.
+    withTools.allowDangerouslySkipPermissions = true;
+  }
+  return withTools;
+}
+
 async function promptAndCollect(
   prompt: string,
-  opts: { model?: string; resume?: string; trace?: boolean; stream?: boolean },
+  opts: PromptCallOpts,
 ): Promise<PromptResult> {
   const q = query({
     prompt,
-    options: {
-      model: opts.model,
-      resume: opts.resume,
-      // chat-only: no tools loaded, no settings sourced (settingSources defaults to []),
-      // empty system prompt (systemPrompt defaults to undefined).
-      tools: [],
-      // includePartialMessages opens a stream_event channel carrying token-level
-      // deltas. Off by default; on for interactive one-shot and REPL paths.
-      includePartialMessages: !!opts.stream,
-    },
+    options: buildSdkOptions(opts),
   });
 
   let reply = "";
@@ -280,6 +327,8 @@ async function runDaemon(opts: CommonOpts): Promise<void> {
         model: opts.model,
         resume: sessionId,
         trace: opts.trace,
+        allowTools: opts.allowTools,
+        permissionMode: opts.permissionMode,
       });
       sessionId = r.sessionId;
       await saveLastSession(r.sessionId);
@@ -381,6 +430,8 @@ interface RawCliOpts {
   connect?: boolean;
   shutdown?: boolean;
   fresh?: boolean;
+  allowTools?: boolean;
+  permissionMode?: PermissionMode;
   model?: string;
   resume?: string;
   socket: string;
@@ -401,6 +452,18 @@ program
   .option("--connect", "send a turn to a running daemon")
   .option("--shutdown", "(with --connect) stop the daemon")
   .option("--fresh", "(with --daemon) ignore persisted last session, start new")
+  .option(
+    "--allow-tools",
+    "enable Claude Code's full tool set (Read/Write/Bash/MCP/...)",
+  )
+  .addOption(
+    new Option(
+      "--permission-mode <mode>",
+      "(with --allow-tools) gate tool calls",
+    )
+      .choices([...PERMISSION_MODES])
+      .default(undefined),
+  )
   .option("--model <m>", "Claude model (defaults to SDK default)")
   .option("--resume <id>", "resume a specific session id")
   .option(
@@ -420,6 +483,8 @@ program
       socket: raw.socket,
       trace: !!raw.trace,
       fresh: !!raw.fresh,
+      allowTools: !!raw.allowTools,
+      permissionMode: raw.permissionMode,
     };
 
     const modes = [raw.daemon, raw.connect, raw.repl].filter(Boolean).length;
@@ -427,6 +492,13 @@ program
       stderr.write("error: --daemon, --connect, --repl are mutually exclusive\n");
       exit(2);
     }
+
+    if (raw.permissionMode && !raw.allowTools) {
+      stderr.write("error: --permission-mode requires --allow-tools\n");
+      exit(2);
+    }
+    // --allow-tools / --permission-mode passed to --connect are silently
+    // ignored: the daemon's tool config is fixed at startup.
 
     if (raw.connect) {
       const prompt = raw.shutdown

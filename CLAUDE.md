@@ -22,11 +22,27 @@ Runtime requirement: a working `claude` binary on `PATH` (currently at `~/.local
 
 One-shot, REPL, daemon, connect — same shape as [gemini-acp's CLAUDE.md §"The four modes"](../gemini-acp/CLAUDE.md#the-four-modes), with these differences:
 
-- All modes share `promptAndCollect` in [src/index.ts](src/index.ts), which calls `query({prompt, options: {model, resume, tools: [], includePartialMessages}})` and accumulates either `assistant` text blocks (non-streaming) or `stream_event` text deltas (streaming) until the `result` message arrives.
-- **`tools: []` (NOT `allowedTools: []`)** is the chat-only switch — the former skips loading tools entirely; the latter only whitelists from a loaded set. See [`Don't`](#dont) below.
+- All modes share `promptAndCollect` in [src/index.ts](src/index.ts), which builds SDK options via `buildSdkOptions` (chat-only or tool-enabled branch) and accumulates either `assistant` text blocks (non-streaming) or `stream_event` text deltas (streaming) until the `result` message arrives.
+- **Default is chat-only**: `tools: []` (NOT `allowedTools: []`) — the former skips loading tools entirely; the latter only whitelists from a loaded set. See [`Don't`](#dont) below.
+- **`--allow-tools` opens up the full Claude Code tool set** — see [Tool access](#tool-access) for permission modes and the cwd allowlist boundary.
 - **Token streaming is on by default** for one-shot and REPL when `--json` is NOT set. The SDK's `includePartialMessages: true` opens a `stream_event` channel carrying Anthropic-SDK `content_block_delta` events; their `text_delta.text` payloads flush to stdout as they arrive. `--json` forces collected output (one JSON line, incompatible with mid-line streaming). Daemon never streams (would need a multi-line wire protocol — see [Future work](#future-work)).
 - **Daemon session continuity** is per-turn `query({resume: lastSessionId})`, where `lastSessionId` is captured from the SDK's `session_id` field (present on `system` / `assistant` / `result` messages alike). No long-lived `claude` subprocess — each turn re-spawns. Cheap because the SDK doesn't pay ACP's npx package-resolution tax.
 - **Daemon ↔ connect wire protocol** is identical to [gemini-acp's TECHNICAL.md §4](../gemini-acp/TECHNICAL.md#4-mode-by-mode-reference). One `\n`-terminated JSON line per direction over `/tmp/claude-chat-$USER.sock`. Request shapes: `{prompt} | {shutdown:true}`. Response shapes: `{reply, stop_reason, session_id} | {ok:true} | {error}`.
+
+## Tool access
+
+By default `claude-chat` is chat-only (no Read / Write / Bash / MCP). `--allow-tools` flips this on by switching the SDK call to:
+
+- `tools: { type: "preset", preset: "claude_code" }` — full Claude Code tool set
+- `systemPrompt: { type: "preset", preset: "claude_code" }` — Claude Code's system prompt teaches the agent how to invoke them
+- `settingSources: ["user", "project"]` — `~/.claude/CLAUDE.md` and the project's `CLAUDE.md` get loaded as context (mirrors a real `claude` invocation in the cwd)
+- `permissionMode` defaults to `acceptEdits` (file edits without prompting; bash/exec still gated). Override with `--permission-mode <mode>`. Valid modes: `default`, `acceptEdits`, `bypassPermissions`, `plan`. `bypassPermissions` additionally sets `allowDangerouslySkipPermissions: true` (the SDK requires the explicit acknowledgement).
+
+**The agent operates in `process.cwd()`** — the SDK enforces a directory allowlist at the boundary between Claude Code's tool implementations and the filesystem. Reading `/tmp/foo` from a `claude-chat` started in `~/Documents/claude-agentic-chat/` will fail with a polite block message; the agent reports it instead of pretending. Honest by construction. To loosen, either `cd` to the parent before launching, or pass `additionalDirectories` (not yet exposed as a flag — would be a `--cwd-allow <path>` addition).
+
+`--permission-mode` is silently ignored in `--connect` mode: the daemon's tool config is fixed at startup. To change it, `--shutdown` and restart with new flags.
+
+See `buildSdkOptions` in [src/index.ts](src/index.ts) for the exact branch.
 
 ## Daemon discipline
 
@@ -78,7 +94,6 @@ After `git init`: local-only, no remote. Per global rule in [`~/.claude/CLAUDE.m
 Not done yet, listed so you don't accidentally invent the same feature twice:
 
 - **Daemon streaming.** Today the daemon collects the full reply server-side and writes one JSON line per request. To stream tokens through the daemon to a `--connect` client, the wire protocol needs a multi-message shape — e.g. NDJSON: `{"chunk":"..."}\n{"chunk":"..."}\n{"reply":"...","stop_reason":"...","session_id":"...","done":true}\n`. Doable but a real protocol-version change.
-- **`--allow-tools`.** Switch from `tools: []` to the Claude Code preset (`tools: { type: "preset", preset: "claude_code" }`) plus a `canUseTool` callback for permission gating. Opens up file/exec/MCP for users who want it.
 - **Streaming-input mode.** Today each turn is a fresh `query({prompt: string, ...})` — re-spawning `claude` per turn. Switching to `query({prompt: asyncIterable, ...})` keeps one `claude` subprocess alive across turns. Only worth doing if profiling shows re-spawn dominates; today the LLM round-trip drowns it out.
 - **Structured `stop_reason`.** Today we forward the SDK's `subtype` verbatim (`"success"`, `"error_max_turns"`, …). Acceptable today; brittle if consumers parse exact strings.
 
@@ -89,5 +104,6 @@ Not done yet, listed so you don't accidentally invent the same feature twice:
 - Don't tighten `SDKMessage` or content-block matches into exhaustive `switch` + `never` checks. The SDK adds variants between minor versions; [src/index.ts](src/index.ts) is intentionally permissive.
 - Don't switch `tools: []` to `allowedTools: []` thinking they mean the same thing. They don't — `tools: []` skips tool loading entirely (chat-only); `allowedTools: []` whitelists from a loaded set (still loads, just denies).
 - Don't auto-spawn a daemon from `--connect`. Same probe-then-bind race window that [gemini-acp](../gemini-acp/CLAUDE.md#dont) avoids; let the user manage daemon lifecycle.
+- Don't reach for `--permission-mode bypassPermissions` casually. It tells the SDK to skip every tool-call confirmation, including arbitrary `Bash` execution — equivalent to running `claude --dangerously-skip-permissions` directly. Use only on disposable VMs / containers, never on a workstation with valuable state.
 - Don't introduce streaming-input mode (`query({prompt: asyncIterable})`) without measuring re-spawn cost first. Per-turn `query({resume})` is cheaper to write and reason about.
 - Don't commit `node_modules/` or `dist/` — already in [.gitignore](.gitignore), but stay alert.
