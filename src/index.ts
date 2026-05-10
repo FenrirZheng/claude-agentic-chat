@@ -17,8 +17,13 @@ const PERMISSION_MODES: readonly PermissionMode[] = [
   "plan",
 ];
 // Single source of truth for the implicit mode when --allow-tools is set
-// without --permission-mode. Used both by buildSdkOptions and the daemon banner.
-const DEFAULT_TOOL_PERMISSION_MODE: PermissionMode = "acceptEdits";
+// without --permission-mode. Used both by buildSdkOptions and the daemon
+// banner. bypassPermissions is the workstation default — chosen so routine
+// `claude-chat --allow-tools "..."` invocations don't need a flag. The SDK's
+// `allowDangerouslySkipPermissions` companion is set automatically in
+// buildSdkOptions; tighten to `acceptEdits`/`plan` when calibration calls
+// for it (see CLAUDE.md `## Don't`).
+const DEFAULT_TOOL_PERMISSION_MODE: PermissionMode = "bypassPermissions";
 
 // Derive the SDK options shape directly from the SDK's own types — no need to
 // re-import or reshape; if the SDK adds a field, this picks it up.

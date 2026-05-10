@@ -87,7 +87,7 @@ The daemon and `--connect` use a small NDJSON protocol over the Unix socket when
 - **Tools**: full Claude Code preset
 - **System prompt**: Claude Code's preset (teaches the agent how to use the tools)
 - **Settings**: `["user", "project"]` — `~/.claude/CLAUDE.md` and the project's `CLAUDE.md` are honoured
-- **Permission mode**: defaults to `acceptEdits` (file edits without prompting; `Bash` / `Write` outside cwd still gated). `--permission-mode bypassPermissions` skips ALL prompts (sets `allowDangerouslySkipPermissions: true` per SDK requirement); reserve for disposable VMs
+- **Permission mode**: defaults to `bypassPermissions` — every tool call (including `Bash`) auto-approved; `allowDangerouslySkipPermissions: true` is set per SDK requirement. Chosen so routine workstation use doesn't need a flag; the cwd directory allowlist still contains filesystem blast radius. Tighten with `--permission-mode acceptEdits` (edits auto, Bash gated), `plan` (read-only), or `default` (every tool gated)
 
 The agent operates in `process.cwd()`. The SDK enforces a directory allowlist at the tool boundary — paths outside cwd get blocked, even under `bypassPermissions`. The agent reports the block honestly rather than confabulating output.
 
