@@ -4,7 +4,7 @@ Project memory for `claude-chat` — a Node / TypeScript CLI that wraps the [Cla
 
 ## Repo shape
 
-- Standalone project at `/home/fenrir/Documents/claude-agentic-chat/`. Currently **not its own git repo** — the parent `$HOME` dotfiles repo's [root `.gitignore`](../../.gitignore) excludes `Documents/`, so the working tree is invisible to that repo. To make this an independent repo (matching `gemini-acp`'s shape), run `git init` from this directory — see [Git](#git) below.
+- Standalone project at `/home/fenrir/Documents/claude-agentic-chat/`, **its own git repo on branch `main`** with remote `origin` at `git@github.com:FenrirZheng/claude-agentic-chat.git`. The parent `$HOME` dotfiles repo's [root `.gitignore`](../../.gitignore) excludes `Documents/`, so this working tree is invisible to that repo. See [Git](#git) below for the conventions.
 - The parent `$HOME` is a separate dotfiles repo (remote `bash-for-fenrir`); the two are unrelated despite the directory nesting — don't confuse `cd` paths between them when switching tmux panes.
 - Tracked-once-init'd: [package.json](package.json), [tsconfig.json](tsconfig.json), [src/index.ts](src/index.ts), this file. Gitignored: `node_modules/`, `dist/`, `*.log`, `.env*` — see [.gitignore](.gitignore).
 
@@ -81,15 +81,9 @@ Both connect calls must emit the **same** `session_id`. Run this after any chang
 
 ## Git
 
-This directory is currently **not its own git repo**. The parent `$HOME` dotfiles repo gitignores `Documents/` so its working tree is invisible there. Recommended init, mirroring [gemini-acp](../gemini-acp/CLAUDE.md#git):
+This directory is **its own git repo** on branch `main`, with remote `origin` at `git@github.com:FenrirZheng/claude-agentic-chat.git`. The parent `$HOME` dotfiles repo gitignores `Documents/` so this working tree is invisible there. Init commit was `7b0ada2 init: four-mode CLI around the Claude Agent SDK`, mirroring [gemini-acp](../gemini-acp/CLAUDE.md#git)'s shape.
 
-```bash
-git init
-git add .gitignore package.json tsconfig.json src/ CLAUDE.md
-git commit -m "init: four-mode CLI around the Claude Agent SDK"
-```
-
-After `git init`: local-only, no remote. Per global rule in [`~/.claude/CLAUDE.md`](../../.claude/CLAUDE.md), no `git push`, no PRs, no opening a remote without asking first. Match the loose subject style of `gemini-acp`'s log.
+Per global rule in [`~/.claude/CLAUDE.md`](../../.claude/CLAUDE.md), no `git push`, no PRs, no opening additional remotes without asking first. Match the loose subject style of the existing log (`feat: ...`, `daemon: ...`, `docs: ...`).
 
 ## Future work
 
@@ -105,6 +99,6 @@ Not done yet, listed so you don't accidentally invent the same feature twice:
 - Don't tighten `SDKMessage` or content-block matches into exhaustive `switch` + `never` checks. The SDK adds variants between minor versions; [src/index.ts](src/index.ts) is intentionally permissive.
 - Don't switch `tools: []` to `allowedTools: []` thinking they mean the same thing. They don't — `tools: []` skips tool loading entirely (chat-only); `allowedTools: []` whitelists from a loaded set (still loads, just denies).
 - Don't auto-spawn a daemon from `--connect`. Same probe-then-bind race window that [gemini-acp](../gemini-acp/CLAUDE.md#dont) avoids; let the user manage daemon lifecycle.
-- Don't reach for `--permission-mode bypassPermissions` casually. It tells the SDK to skip every tool-call confirmation, including arbitrary `Bash` execution — equivalent to running `claude --dangerously-skip-permissions` directly. Use only on disposable VMs / containers, never on a workstation with valuable state.
+- Don't reach for `--permission-mode bypassPermissions` blindly when **the prompt is open-ended AND the inputs include external/untrusted content** (e.g. "investigate and fix issues here" while feeding in web fetch results / unknown file contents). Tool outputs can carry prompt injection, and bypass turns that into direct shell execution. For bounded prompts with self-typed inputs (explicit commands, listed paths, named files in cwd) bypass is the pragmatic default — same risk profile as running `Bash` in the main session. The risk gate is `prompt openness × input trust`, not the flag itself; the SDK's scary `allowDangerouslySkipPermissions` name overstates the routine case.
 - Don't introduce streaming-input mode (`query({prompt: asyncIterable})`) without measuring re-spawn cost first. Per-turn `query({resume})` is cheaper to write and reason about.
 - Don't commit `node_modules/` or `dist/` — already in [.gitignore](.gitignore), but stay alert.
