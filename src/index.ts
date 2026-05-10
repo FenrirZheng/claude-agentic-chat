@@ -16,6 +16,9 @@ const PERMISSION_MODES: readonly PermissionMode[] = [
   "bypassPermissions",
   "plan",
 ];
+// Single source of truth for the implicit mode when --allow-tools is set
+// without --permission-mode. Used both by buildSdkOptions and the daemon banner.
+const DEFAULT_TOOL_PERMISSION_MODE: PermissionMode = "acceptEdits";
 
 // Derive the SDK options shape directly from the SDK's own types — no need to
 // re-import or reshape; if the SDK adds a field, this picks it up.
@@ -136,7 +139,7 @@ function buildSdkOptions(opts: PromptCallOpts): SdkOptions {
   // Tools enabled: pull in Claude Code's full tool set + system prompt, and
   // load user + project settings so CLAUDE.md gets honoured. Permission mode
   // gates what the agent may do without prompting.
-  const mode: PermissionMode = opts.permissionMode ?? "acceptEdits";
+  const mode: PermissionMode = opts.permissionMode ?? DEFAULT_TOOL_PERMISSION_MODE;
   const withTools: SdkOptions = {
     ...base,
     tools: { type: "preset", preset: "claude_code" },
@@ -403,7 +406,12 @@ async function runDaemon(opts: CommonOpts): Promise<void> {
 
   server.listen(opts.socket, () => {
     if (!opts.quiet) {
-      stderr.write(`claude-chat daemon listening on ${opts.socket}\n`);
+      const toolsLabel = opts.allowTools
+        ? `tools: claude_code, permission: ${opts.permissionMode ?? DEFAULT_TOOL_PERMISSION_MODE}`
+        : "chat-only";
+      stderr.write(
+        `claude-chat daemon listening on ${opts.socket} (${toolsLabel})\n`,
+      );
     }
   });
 
