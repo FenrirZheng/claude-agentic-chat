@@ -4,7 +4,7 @@ A small Node / TypeScript CLI that talks to [Anthropic's Claude Agent SDK](https
 
 The daemon mode is the standout — it holds one Claude session in memory and amortises spawn cost across many turns, dropping per-turn latency to a clean LLM round-trip. Combined with NDJSON streaming over the daemon's Unix socket, that makes Claude practical to call from inside multi-step shell pipelines and from Claude Code's `Bash` tool, neither of which can keep a REPL alive across calls.
 
-Token streaming is on by default. Tool use is opt-in via `--allow-tools`. Session state persists across daemon restarts via `${XDG_STATE_HOME:-~/.local/state}/claude-chat/last-session`.
+Token streaming is on by default. Tool use is opt-in via `--allow-tools`. Session state persists across daemon restarts via a pointer file under `${XDG_STATE_HOME:-~/.local/state}/claude-chat/` — `last-session` for the default socket, or a per-instance `last-session-<socket>-<hash>` when you run a daemon on a custom `--socket` (so several daemons don't clobber each other). Override the path explicitly with `--state-file`.
 
 ## Requirements
 
@@ -69,7 +69,8 @@ claude-chat --allow-tools "summarise the structure of this repo"
 | `--fresh` | (Daemon) Ignore persisted last session, start a new conversation |
 | `--allow-tools` | Enable Claude Code's full tool set + system prompt; loads user / project settings |
 | `--permission-mode <m>` | (With `--allow-tools`) `default` / `acceptEdits` / `bypassPermissions` / `plan` |
-| `--socket <path>` | Daemon socket path. Default: `/tmp/claude-chat-$USER.sock` |
+| `--socket <path>` | Daemon socket path. Default: `/tmp/claude-chat-$USER.sock`. A non-default value also gives the daemon its own state file |
+| `--state-file <path>` | (Daemon) Override the resume-pointer file path (default: derived from `--socket`) |
 | `--shutdown` | (With `--connect`) stop the running daemon |
 
 ## Streaming
@@ -105,15 +106,15 @@ claude-chat --connect --shutdown
 
 Break-even vs cold-start-each is the second call. Multi-call workflows save proportionally.
 
-If the daemon dies or the machine reboots, the next `--daemon` start auto-reads `${XDG_STATE_HOME:-~/.local/state}/claude-chat/last-session` and resumes the prior conversation transparently. To force a fresh thread: `--daemon --fresh`. To wipe state manually: `rm ~/.local/state/claude-chat/last-session`.
+If the daemon dies or the machine reboots, the next `--daemon` start auto-reads its pointer file (under `${XDG_STATE_HOME:-~/.local/state}/claude-chat/` — the resolved path is echoed in the startup banner as `claude-chat: state file <path>`) and resumes the prior conversation transparently. To force a fresh thread: `--daemon --fresh`. To wipe state manually: `rm` the path from that banner line.
 
 ## Daemon discipline
 
-- **Default socket**: `/tmp/claude-chat-$USER.sock`. Override with `--socket PATH`
+- **Default socket**: `/tmp/claude-chat-$USER.sock` — a per-user singleton. Override with `--socket PATH`
 - **Stale-socket detection**: probe-then-remove. Live daemon at the path → refuse to start with an error. Orphaned socket (no listener) → unlink and bind
 - **Clean stop**: `claude-chat --connect --shutdown`. `SIGINT` / `SIGTERM` also remove the socket
 - **One in-flight request at a time**. Concurrent `--connect` calls serialise on the daemon's accept queue. A long streaming response holds the queue until its `done:true` terminator goes out — by design (interleaving streams across one session would be incoherent)
-- **One session per daemon**. To multiplex sessions, run multiple daemons on different `--socket` paths
+- **One session per daemon**. To multiplex sessions, run multiple daemons on distinct `--socket` paths — each non-default socket automatically gets its own state file, so they don't clobber each other's resume pointer. (Or pin one explicitly with `--state-file`.) Two Claude Code sessions on the same machine that each want a persistent side-claude daemon **must** pick distinct `--socket` paths; for a throwaway side-task that doesn't need persistence, one-shot `claude-chat --json "Q"` has no daemon and no state file — zero coupling
 
 ## Documentation map
 

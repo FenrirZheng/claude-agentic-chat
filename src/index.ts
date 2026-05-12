@@ -2,10 +2,11 @@
 import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { Command, Option } from "commander";
 import { createServer, createConnection, type Socket } from "node:net";
+import { createHash } from "node:crypto";
 import { existsSync, unlinkSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { stdin, stdout, stderr, exit } from "node:process";
 import { createInterface } from "node:readline";
 
@@ -35,6 +36,14 @@ interface CommonOpts {
   json: boolean;
   quiet: boolean;
   socket: string;
+  // Whether --socket was supplied on the CLI (vs. left at its default). Drives
+  // the daemon's state-file naming — see resolveStatePath. We key off commander's
+  // option source rather than string-comparing the path against the default,
+  // because that comparison is fragile (trailing slashes / symlinks / env timing).
+  socketExplicit: boolean;
+  // --state-file <path>: explicit override for the daemon's resume-pointer file.
+  // Highest precedence in resolveStatePath. Only the daemon reads it.
+  stateFile?: string;
   trace: boolean;
   fresh: boolean;
   allowTools: boolean;
@@ -73,18 +82,43 @@ interface DaemonResponse {
 
 // ── persisted session state ─────────────────────────────────────────────────
 
-// XDG_STATE_HOME/claude-chat/last-session — daemon-only auto-resume.
-// One-shot and REPL modes intentionally don't read or write this; ad-hoc calls
-// staying ad-hoc is the more useful default.
-function getStatePath(): string {
+// Daemon-only auto-resume pointer. One-shot and REPL modes intentionally don't
+// read or write this; ad-hoc calls staying ad-hoc is the more useful default.
+//
+// The file lives under ${XDG_STATE_HOME:-~/.local/state}/claude-chat/. Its NAME
+// is tied to the daemon instance so two concurrent daemons (different --socket)
+// don't clobber each other's resume pointer — see resolveStatePath.
+function stateDir(): string {
   const xdg = process.env.XDG_STATE_HOME;
   const base = xdg && xdg.length > 0 ? xdg : join(homedir(), ".local", "state");
-  return join(base, "claude-chat", "last-session");
+  return join(base, "claude-chat");
 }
 
-async function loadLastSession(): Promise<string | undefined> {
+// Resolve the daemon's resume-pointer file. Precedence, highest first:
+//   1. --state-file <path>       → exactly that path (resolved to absolute)
+//   2. --socket given on the CLI → ${stateDir}/last-session-<basename>-<sha1(abspath(socket))[:8]>
+//   3. neither                   → ${stateDir}/last-session  (the historical name; zero migration)
+// Rule 2 keys off whether --socket was *supplied* (commander's option source),
+// not a string compare against the default path — that comparison is fragile
+// re: trailing slashes, symlinks, and env-expansion timing. path.resolve (not
+// fs.realpath) is deliberate: the socket usually doesn't exist yet, so realpath
+// would throw; the cost is that /tmp/foo and /tmp/../tmp/foo hash differently —
+// pass a clean socket path if you run several daemons.
+function resolveStatePath(opts: {
+  stateFile?: string;
+  socket: string;
+  socketExplicit: boolean;
+}): string {
+  if (opts.stateFile) return resolve(opts.stateFile);
+  if (!opts.socketExplicit) return join(stateDir(), "last-session");
+  const tag = createHash("sha1").update(resolve(opts.socket)).digest("hex").slice(0, 8);
+  const label = basename(opts.socket).replace(/[^A-Za-z0-9._-]/g, "-");
+  return join(stateDir(), `last-session-${label}-${tag}`);
+}
+
+async function loadLastSession(path: string): Promise<string | undefined> {
   try {
-    const content = await readFile(getStatePath(), "utf8");
+    const content = await readFile(path, "utf8");
     const id = content.trim();
     return id.length > 0 ? id : undefined;
   } catch {
@@ -92,9 +126,8 @@ async function loadLastSession(): Promise<string | undefined> {
   }
 }
 
-async function saveLastSession(id: string): Promise<void> {
+async function saveLastSession(path: string, id: string): Promise<void> {
   if (!id) return;
-  const path = getStatePath();
   try {
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, id + "\n", "utf8");
@@ -295,11 +328,15 @@ async function runDaemon(opts: CommonOpts): Promise<void> {
     unlinkSync(opts.socket);
   }
 
+  // Where this daemon's resume pointer lives — tied to the socket instance (or
+  // pinned by --state-file) so a second concurrent daemon doesn't clobber it.
+  const statePath = resolveStatePath(opts);
+
   // Resolve initial session: explicit --resume wins, then persisted last session
   // (unless --fresh suppresses it), then undefined (start a new conversation).
   let sessionId: string | undefined = opts.resume;
   if (!sessionId && !opts.fresh) {
-    const persisted = await loadLastSession();
+    const persisted = await loadLastSession(statePath);
     if (persisted) {
       sessionId = persisted;
       if (!opts.quiet) {
@@ -370,7 +407,7 @@ async function runDaemon(opts: CommonOpts): Promise<void> {
           : undefined,
       });
       sessionId = r.sessionId;
-      await saveLastSession(r.sessionId);
+      await saveLastSession(statePath, r.sessionId);
       const terminator: DaemonResponse = wantsStream
         ? {
             reply: r.reply,
@@ -417,6 +454,7 @@ async function runDaemon(opts: CommonOpts): Promise<void> {
       stderr.write(
         `claude-chat daemon listening on ${opts.socket} (${toolsLabel})\n`,
       );
+      stderr.write(`claude-chat: state file ${statePath}\n`);
     }
   });
 
@@ -521,6 +559,7 @@ interface RawCliOpts {
   model?: string;
   resume?: string;
   socket: string;
+  stateFile?: string;
   json?: boolean;
   quiet?: boolean;
   trace?: boolean;
@@ -557,6 +596,10 @@ program
     "daemon socket path",
     `/tmp/claude-chat-${userInfo().username}.sock`,
   )
+  .option(
+    "--state-file <path>",
+    "(with --daemon) resume-pointer file path (default: derived from --socket)",
+  )
   .option("--json", "JSON output: {reply, stop_reason, session_id}")
   .option("-q, --quiet", "REPL without chrome / daemon without banner")
   .option("--trace", "dump SDK message stream to stderr")
@@ -567,6 +610,8 @@ program
       json: !!raw.json,
       quiet: !!raw.quiet,
       socket: raw.socket,
+      socketExplicit: program.getOptionValueSource("socket") !== "default",
+      stateFile: raw.stateFile,
       trace: !!raw.trace,
       fresh: !!raw.fresh,
       allowTools: !!raw.allowTools,
